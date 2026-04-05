@@ -1,16 +1,15 @@
 #!/bin/bash
 
 # ============================================================
-#         RECON TOOLS FULL INSTALLATION SCRIPT
-#         Includes: Go tools, Python tools, GF Patterns
+#     DISK SPACE FIX + SAFE RECON TOOLS INSTALLER
+#     Fixes: "No space left on device" during go install
 # ============================================================
-
-set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 log_info()    { echo -e "${CYAN}[*] $1${NC}"; }
@@ -19,365 +18,210 @@ log_warn()    { echo -e "${YELLOW}[!] $1${NC}"; }
 log_error()   { echo -e "${RED}[-] $1${NC}"; }
 
 # ============================================================
-# MOVE GO BINARY TO /usr/bin (replaces old if exists)
+# STEP 1: SHOW DISK USAGE BEFORE CLEANUP
+# ============================================================
+echo ""
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo -e "${BOLD}${CYAN}         DISK SPACE BEFORE CLEANUP${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+df -h /
+echo ""
+
+# ============================================================
+# STEP 2: AGGRESSIVE CLEANUP
+# ============================================================
+log_info "Cleaning /tmp ..."
+sudo rm -rf /tmp/go-build* /tmp/go-link* /tmp/*.tar.gz /tmp/*.zip /tmp/gau_build /tmp/gf_patterns_tmp
+sudo find /tmp -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null
+
+log_info "Cleaning apt cache..."
+sudo apt-get clean -y
+sudo apt-get autoclean -y
+sudo apt-get autoremove -y
+
+log_info "Cleaning Go build cache..."
+go clean -cache -testcache -modcache 2>/dev/null || true
+
+log_info "Removing old Go module downloads..."
+rm -rf "$HOME/go/pkg/mod/cache" 2>/dev/null || true
+
+log_info "Cleaning old Go binaries (if duplicate)..."
+find "$HOME/go/bin" -type f | while read bin; do
+    name=$(basename "$bin")
+    if [ -f "/usr/bin/$name" ]; then
+        log_warn "Removing duplicate in ~/go/bin: $name"
+        rm -f "$bin"
+    fi
+done
+
+log_info "Removing leftover temp build dirs..."
+rm -rf /tmp/nuclei_build /tmp/katana_build /tmp/httpx_build 2>/dev/null || true
+
+# Check for large files in home
+log_info "Finding large files (>100MB) in home..."
+find "$HOME" -maxdepth 4 -type f -size +100M 2>/dev/null | while read f; do
+    SIZE=$(du -sh "$f" 2>/dev/null | cut -f1)
+    log_warn "Large file: $f ($SIZE)"
+done
+
+# ============================================================
+# STEP 3: SHOW DISK USAGE AFTER CLEANUP
+# ============================================================
+echo ""
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo -e "${BOLD}${CYAN}         DISK SPACE AFTER CLEANUP${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+df -h /
+echo ""
+
+FREE_KB=$(df / | tail -1 | awk '{print $4}')
+FREE_GB=$(echo "scale=1; $FREE_KB / 1024 / 1024" | bc 2>/dev/null || echo "?")
+
+if [ "$FREE_KB" -lt 2097152 ] 2>/dev/null; then
+    log_error "Still less than 2GB free (${FREE_GB}GB). Tools may fail to compile."
+    log_warn "Consider: sudo rm -rf /var/log/*.gz /var/cache/apt /snap/* (if snap is used)"
+    log_warn "Or free up space manually and re-run."
+    echo ""
+    echo -e "${YELLOW}Continue anyway? (y/n):${NC}"
+    read -r CONTINUE
+    [ "$CONTINUE" != "y" ] && exit 1
+else
+    log_success "Enough space available (${FREE_GB}GB free). Proceeding..."
+fi
+
+# ============================================================
+# CONFIGURE TMPDIR TO A BIGGER PARTITION (if /tmp is small)
+# ============================================================
+log_info "Setting TMPDIR to $HOME/tmp for Go linker..."
+mkdir -p "$HOME/tmp"
+export TMPDIR="$HOME/tmp"
+export GOTMPDIR="$HOME/tmp"
+
+# ============================================================
+# HELPER FUNCTIONS
 # ============================================================
 install_go_binary() {
     local TOOL_NAME="$1"
     local BIN_PATH="$HOME/go/bin/$TOOL_NAME"
-
     if [ -f "$BIN_PATH" ]; then
-        if [ -f "/usr/bin/$TOOL_NAME" ]; then
-            log_warn "Removing old /usr/bin/$TOOL_NAME"
-            sudo rm -f "/usr/bin/$TOOL_NAME"
-        fi
+        sudo rm -f "/usr/bin/$TOOL_NAME"
         sudo mv "$BIN_PATH" "/usr/bin/$TOOL_NAME"
-        log_success "$TOOL_NAME moved to /usr/bin/$TOOL_NAME"
+        log_success "$TOOL_NAME → /usr/bin/$TOOL_NAME"
     else
         log_error "$TOOL_NAME binary not found at $BIN_PATH"
     fi
 }
 
-# ============================================================
-# PREREQUISITES
-# ============================================================
-log_info "Updating system packages..."
-sudo apt-get update -y
-
-log_info "Installing prerequisites..."
-sudo apt-get install -y \
-    git curl wget build-essential \
-    python3 python3-pip python3-venv \
-    libpcap-dev gcc
-
-# ============================================================
-# GO INSTALLATION CHECK
-# ============================================================
-if ! command -v go &>/dev/null; then
-    log_info "Go not found. Installing Go..."
-    GO_VERSION="1.22.0"
-    wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz
-    sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf /tmp/go.tar.gz
-    export PATH=$PATH:/usr/local/go/bin
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-    log_success "Go installed: $(go version)"
-else
-    log_success "Go already installed: $(go version)"
-fi
+go_install_safe() {
+    local TOOL="$1"
+    local PKG="$2"
+    log_info "Installing $TOOL ..."
+    if TMPDIR="$HOME/tmp" GOTMPDIR="$HOME/tmp" go install "$PKG" 2>&1; then
+        install_go_binary "$TOOL"
+        log_success "$TOOL installed."
+    else
+        log_error "$TOOL installation failed. Skipping..."
+    fi
+    # Clean tmp after each install to free space
+    rm -rf "$HOME/tmp/go-build"* "$HOME/tmp/go-link"* 2>/dev/null
+}
 
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
 
 # ============================================================
-# 1. FFUF
+# INSTALL GO TOOLS (one by one, cleaning between each)
 # ============================================================
-log_info "Installing ffuf..."
-go install github.com/ffuf/ffuf/v2@latest
-install_go_binary "ffuf"
-log_success "ffuf installed successfully."
+echo ""
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo -e "${BOLD}${CYAN}         INSTALLING GO TOOLS${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo ""
 
-# ============================================================
-# 2. DALFOX
-# ============================================================
-log_info "Installing dalfox..."
-go install github.com/hahwul/dalfox/v2@latest
-install_go_binary "dalfox"
-log_success "dalfox installed successfully."
+go_install_safe "ffuf"      "github.com/ffuf/ffuf/v2@latest"
+go_install_safe "dalfox"    "github.com/hahwul/dalfox/v2@latest"
+go_install_safe "httpx"     "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+go_install_safe "subfinder" "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+go_install_safe "waybackurls" "github.com/tomnomnom/waybackurls@latest"
+go_install_safe "dnsx"      "github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+go_install_safe "hakrawler" "github.com/hakluke/hakrawler@latest"
+go_install_safe "gf"        "github.com/tomnomnom/gf@latest"
 
-# ============================================================
-# 3. KATANA
-# ============================================================
-log_info "Installing katana..."
-CGO_ENABLED=1 go install github.com/projectdiscovery/katana/cmd/katana@latest
-install_go_binary "katana"
-log_success "katana installed successfully."
+# Katana needs CGO
+log_info "Installing katana (CGO_ENABLED=1)..."
+if CGO_ENABLED=1 TMPDIR="$HOME/tmp" GOTMPDIR="$HOME/tmp" go install github.com/projectdiscovery/katana/cmd/katana@latest 2>&1; then
+    install_go_binary "katana"
+    log_success "katana installed."
+else
+    log_error "katana failed. Try: sudo apt-get install -y libpcap-dev and retry."
+fi
+rm -rf "$HOME/tmp/go-build"* "$HOME/tmp/go-link"* 2>/dev/null
 
-# ============================================================
-# 4. NUCLEI + TEMPLATES
-# ============================================================
+# Nuclei — uses CGO via sqlite, needs extra deps
+log_info "Installing nuclei dependencies..."
+sudo apt-get install -y gcc libsqlite3-dev 2>/dev/null
+
 log_info "Installing nuclei..."
-go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-install_go_binary "nuclei"
-
-log_info "Cloning nuclei-templates..."
-NUCLEI_TEMPLATES_DIR="$HOME/nuclei-templates"
-if [ -d "$NUCLEI_TEMPLATES_DIR" ]; then
-    log_warn "nuclei-templates already exists. Pulling latest..."
-    git -C "$NUCLEI_TEMPLATES_DIR" pull
+if CGO_ENABLED=1 TMPDIR="$HOME/tmp" GOTMPDIR="$HOME/tmp" go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>&1; then
+    install_go_binary "nuclei"
+    log_success "nuclei installed."
 else
-    git clone https://github.com/projectdiscovery/nuclei-templates.git "$NUCLEI_TEMPLATES_DIR"
+    log_warn "nuclei CGO install failed. Trying CGO_ENABLED=0..."
+    if CGO_ENABLED=0 TMPDIR="$HOME/tmp" GOTMPDIR="$HOME/tmp" go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>&1; then
+        install_go_binary "nuclei"
+        log_success "nuclei installed (CGO disabled)."
+    else
+        log_error "nuclei installation failed."
+    fi
 fi
-log_success "nuclei installed and templates cloned to $NUCLEI_TEMPLATES_DIR"
+rm -rf "$HOME/tmp/go-build"* "$HOME/tmp/go-link"* 2>/dev/null
 
-# ============================================================
-# 5. HTTPX
-# ============================================================
-log_info "Installing httpx..."
-go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-install_go_binary "httpx"
-log_success "httpx installed successfully."
-
-# ============================================================
-# 6. SUBFINDER
-# ============================================================
-log_info "Installing subfinder..."
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-install_go_binary "subfinder"
-log_success "subfinder installed successfully."
-
-# ============================================================
-# 7. WAYBACKURLS
-# ============================================================
-log_info "Installing waybackurls..."
-go install github.com/tomnomnom/waybackurls@latest
-install_go_binary "waybackurls"
-log_success "waybackurls installed successfully."
-
-# ============================================================
-# 8. GAU
-# ============================================================
+# GAU (build from source)
 log_info "Installing gau..."
-GAU_DIR="/tmp/gau_build"
+GAU_DIR="$HOME/tmp/gau_build"
 rm -rf "$GAU_DIR"
-git clone https://github.com/lc/gau.git "$GAU_DIR"
+git clone https://github.com/lc/gau.git "$GAU_DIR" 2>&1
 cd "$GAU_DIR/cmd/gau"
-go build -o gau
-if [ -f "/usr/bin/gau" ]; then
+if TMPDIR="$HOME/tmp" go build -o gau 2>&1; then
     sudo rm -f /usr/bin/gau
+    sudo mv gau /usr/bin/gau
+    log_success "gau installed → /usr/bin/gau"
+else
+    log_error "gau build failed."
 fi
-sudo mv gau /usr/bin/gau
 cd ~
 rm -rf "$GAU_DIR"
-log_success "gau installed successfully."
 
 # ============================================================
-# 9. DNSX
+# NUCLEI TEMPLATES
 # ============================================================
-log_info "Installing dnsx..."
-go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-install_go_binary "dnsx"
-log_success "dnsx installed successfully."
-
-# ============================================================
-# 10. HAKRAWLER
-# ============================================================
-log_info "Installing hakrawler..."
-go install github.com/hakluke/hakrawler@latest
-install_go_binary "hakrawler"
-log_success "hakrawler installed successfully."
-
-# ============================================================
-# 11. PARAMSPIDER
-# ============================================================
-log_info "Installing ParamSpider..."
-PARAMSPIDER_DIR="$HOME/tools/ParamSpider"
-if [ -d "$PARAMSPIDER_DIR" ]; then
-    log_warn "ParamSpider already exists. Pulling latest..."
-    git -C "$PARAMSPIDER_DIR" pull
+log_info "Cloning/updating nuclei-templates..."
+NUCLEI_TEMPLATES="$HOME/nuclei-templates"
+if [ -d "$NUCLEI_TEMPLATES" ]; then
+    git -C "$NUCLEI_TEMPLATES" pull
 else
-    mkdir -p "$HOME/tools"
-    git clone https://github.com/devanshbatham/ParamSpider.git "$PARAMSPIDER_DIR"
-fi
-cd "$PARAMSPIDER_DIR"
-pip3 install -r requirements.txt --break-system-packages 2>/dev/null || pip3 install -r requirements.txt
-if [ -f "setup.py" ]; then
-    python3 setup.py install 2>/dev/null || true
-fi
-# Make paramspider accessible globally
-if [ -f "$PARAMSPIDER_DIR/paramspider.py" ]; then
-    sudo ln -sf "$PARAMSPIDER_DIR/paramspider.py" /usr/bin/paramspider
-    sudo chmod +x /usr/bin/paramspider
-fi
-cd ~
-log_success "ParamSpider installed successfully."
-log_info "  Usage: paramspider -d <domain>"
-
-# ============================================================
-# 12. OPENREDIREX
-# ============================================================
-log_info "Installing OpenRedireX..."
-OPENREDIREX_DIR="$HOME/tools/OpenRedireX"
-if [ -d "$OPENREDIREX_DIR" ]; then
-    log_warn "OpenRedireX already exists. Pulling latest..."
-    git -C "$OPENREDIREX_DIR" pull
-else
-    mkdir -p "$HOME/tools"
-    git clone https://github.com/devanshbatham/OpenRedireX.git "$OPENREDIREX_DIR"
-fi
-cd "$OPENREDIREX_DIR"
-if [ -f "setup.sh" ]; then
-    chmod +x setup.sh
-    bash setup.sh 2>/dev/null || true
-fi
-pip3 install -r requirements.txt --break-system-packages 2>/dev/null || pip3 install -r requirements.txt 2>/dev/null || true
-# Make openredirex accessible globally
-if [ -f "$OPENREDIREX_DIR/openredirex.py" ]; then
-    sudo ln -sf "$OPENREDIREX_DIR/openredirex.py" /usr/bin/openredirex
-    sudo chmod +x /usr/bin/openredirex
-fi
-cd ~
-log_success "OpenRedireX installed successfully."
-log_info "  Usage: cat urls.txt | openredirex"
-
-# ============================================================
-# 13. JIRA-LENS
-# ============================================================
-log_info "Installing Jira-Lens..."
-JIRALENS_DIR="$HOME/tools/Jira-Lens"
-if [ -d "$JIRALENS_DIR" ]; then
-    log_warn "Jira-Lens already exists. Pulling latest..."
-    git -C "$JIRALENS_DIR" pull
-else
-    mkdir -p "$HOME/tools"
-    git clone https://github.com/MayankPandey01/Jira-Lens.git "$JIRALENS_DIR"
-fi
-cd "$JIRALENS_DIR"
-
-# Create virtual environment
-python3 -m venv pyenv
-source pyenv/bin/activate
-
-pip3 install -r requirements.txt 2>/dev/null || true
-python3 setup.py install 2>/dev/null || true
-pip3 install progressbar requests colorama 2>/dev/null || true
-
-deactivate
-
-# Create a wrapper script for Jira-Lens
-sudo tee /usr/bin/jira-lens > /dev/null <<EOF
-#!/bin/bash
-cd "$JIRALENS_DIR"
-source pyenv/bin/activate
-python3 Jira-Lens.py "\$@"
-deactivate
-EOF
-sudo chmod +x /usr/bin/jira-lens
-
-cd ~
-log_success "Jira-Lens installed successfully."
-log_info "  Usage: jira-lens -u <target_url>"
-
-# ============================================================
-# GF PATTERNS INSTALLATION
-# ============================================================
-log_info "Installing GF tool..."
-go install github.com/tomnomnom/gf@latest
-install_go_binary "gf"
-
-# Setup .gf directory
-mkdir -p "$HOME/.gf"
-TARGET_DIR="$HOME/.gf"
-
-log_info "Cloning GF pattern repositories..."
-
-GF_REPOS=(
-    "https://github.com/tomnomnom/gfdecos"
-    "https://github.com/r00tkie/grep-pattern"
-    "https://github.com/mrofisr/gf-patterns"
-    "https://github.com/robre/gf-patterns"
-    "https://github.com/1ndianl33t/Gf-Patterns"
-    "https://github.com/dwisiswant0/gf-secrets"
-    "https://github.com/bp0lr/myGF_patterns"
-    "https://github.com/cypher3107/GF-Patterns"
-    "https://github.com/Matir/gf-patterns"
-    "https://github.com/Isaac-The-Brave/GF-Patterns-Redux"
-    "https://github.com/arthur4ires/gfPatterns"
-    "https://github.com/R0X4R/Garud"
-    "https://github.com/seqrity/Allin1gf"
-    "https://github.com/Jude-Paul/GF-Patterns-For-Dangerous-PHP-Functions"
-    "https://github.com/NitinYadav00/gf-patterns"
-    "https://github.com/scumdestroy/YouthCrew-GF-Patterns"
-)
-
-GF_TMP_DIR="/tmp/gf_patterns_tmp"
-mkdir -p "$GF_TMP_DIR"
-cd "$GF_TMP_DIR"
-
-for repo in "${GF_REPOS[@]}"; do
-    REPO_NAME=$(basename "$repo")
-    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$repo")
-
-    if [ "$HTTP_STATUS" = "200" ]; then
-        log_info "Cloning $repo..."
-        rm -rf "$REPO_NAME"
-        if git clone --depth 1 "$repo" "$REPO_NAME" 2>/dev/null; then
-            # Move all JSON pattern files to ~/.gf (overwrite existing)
-            find "$REPO_NAME" -name "*.json" -exec bash -c '
-                src="$1"; dst="'"$TARGET_DIR"'/$(basename "$src")"
-                if [ -f "$dst" ]; then rm -f "$dst"; fi
-                cp "$src" "$dst"
-            ' _ {} \;
-            find "$REPO_NAME" -name "*.JSON" -exec bash -c '
-                src="$1"; dst="'"$TARGET_DIR"'/$(basename "$src")"
-                if [ -f "$dst" ]; then rm -f "$dst"; fi
-                cp "$src" "$dst"
-            ' _ {} \;
-            rm -rf "$REPO_NAME"
-            log_success "Patterns from $REPO_NAME installed."
-        else
-            log_warn "Failed to clone $repo, skipping."
-        fi
-    else
-        log_warn "$repo returned HTTP $HTTP_STATUS — skipping."
-    fi
-done
-
-cd ~
-rm -rf "$GF_TMP_DIR"
-log_success "GF patterns installed to $TARGET_DIR"
-
-# Setup gf completions
-if [ -d "$HOME/go/src/github.com/tomnomnom/gf" ]; then
-    cp "$HOME/go/src/github.com/tomnomnom/gf/gf-completion.bash" "$HOME/.gf/" 2>/dev/null || true
+    git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git "$NUCLEI_TEMPLATES"
 fi
 
 # ============================================================
-# PATH SETUP IN .bashrc / .zshrc
-# ============================================================
-log_info "Setting up PATH in shell config..."
-
-SHELL_RC="$HOME/.bashrc"
-if [ -f "$HOME/.zshrc" ]; then
-    SHELL_RC="$HOME/.zshrc"
-fi
-
-grep -q 'export PATH=$PATH:/usr/local/go/bin' "$SHELL_RC" 2>/dev/null || \
-    echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> "$SHELL_RC"
-
-grep -q 'source ~/.gf/gf-completion.bash' "$SHELL_RC" 2>/dev/null || \
-    echo 'source ~/.gf/gf-completion.bash 2>/dev/null || true' >> "$SHELL_RC"
-
-# ============================================================
-# FINAL SUMMARY
+# FINAL CHECK
 # ============================================================
 echo ""
-echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}         ALL TOOLS INSTALLED SUCCESSFULLY!${NC}"
-echo -e "${GREEN}============================================================${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
+echo -e "${BOLD}${CYAN}         INSTALLATION SUMMARY${NC}"
+echo -e "${BOLD}${CYAN}============================================================${NC}"
 echo ""
-echo -e "${CYAN}Go Tools (available in /usr/bin):${NC}"
-for tool in ffuf dalfox katana nuclei httpx subfinder waybackurls dnsx hakrawler gau gf; do
+
+TOOLS="ffuf dalfox katana nuclei httpx subfinder waybackurls gau dnsx hakrawler gf"
+for tool in $TOOLS; do
     if command -v "$tool" &>/dev/null; then
-        echo -e "  ${GREEN}✔${NC} $tool"
+        echo -e "  ${GREEN}✔${NC} $tool  →  $(which $tool)"
     else
-        echo -e "  ${RED}✘${NC} $tool (check manually)"
+        echo -e "  ${RED}✘${NC} $tool  →  NOT FOUND"
     fi
 done
 
 echo ""
-echo -e "${CYAN}Python Tools:${NC}"
-for tool in paramspider openredirex jira-lens; do
-    if command -v "$tool" &>/dev/null || [ -f "/usr/bin/$tool" ]; then
-        echo -e "  ${GREEN}✔${NC} $tool"
-    else
-        echo -e "  ${RED}✘${NC} $tool (check manually)"
-    fi
-done
-
+df -h /
 echo ""
-echo -e "${CYAN}GF Patterns:${NC}"
-GF_COUNT=$(ls "$HOME/.gf/"*.json 2>/dev/null | wc -l)
-echo -e "  ${GREEN}✔${NC} $GF_COUNT pattern files installed to ~/.gf/"
-
-echo ""
-echo -e "${YELLOW}NOTE: Run 'source ~/.bashrc' (or restart terminal) to apply PATH changes.${NC}"
+log_success "Done! Run 'source ~/.bashrc' to refresh PATH."
 echo ""
