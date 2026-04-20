@@ -2,30 +2,34 @@
 
 # Ensure the script is run with sudo
 if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root (use sudo)." 
-   exit 1
+   echo "Requesting root privileges..."
+   exec sudo "$0" "$@"
 fi
 
-echo "--- Starting System Update Sequence ---"
+echo "--- [1/2] Checking VLC installation ---"
+if ! command -v vlc &> /dev/null; then
+    echo "VLC not found. Installing..."
+    apt update && apt install -y vlc
+else
+    echo "VLC is already installed."
+fi
+
+echo "--- [2/2] Starting System Update Sequence ---"
 
 # 1. Update package list
-echo "[1/5] Updating package lists..."
+echo "Updating package lists..."
 apt update -y
 
 # 2. Upgrade current packages
-echo "[2/5] Upgrading installed packages..."
+echo "Upgrading installed packages..."
 apt upgrade -y
 
-# 3. Perform full-upgrade (handles dependency changes)
-echo "[3/5] Performing full-upgrade..."
+# 3. Perform full-upgrade
+echo "Performing full-upgrade..."
 apt full-upgrade -y
 
-# 4. Remove unused dependencies
-echo "[4/5] Removing orphaned dependencies..."
-apt autoremove -y
-
-# 5. Clean up local package cache
-echo "[5/5] Cleaning up package cache..."
-apt autoclean
+# 4. Remove unused and clean up
+echo "Cleaning up..."
+apt autoremove -y && apt autoclean
 
 echo "--- System maintenance completed successfully! ---"
