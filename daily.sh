@@ -6,15 +6,7 @@ if [[ $EUID -ne 0 ]]; then
    exec sudo "$0" "$@"
 fi
 
-echo "--- [1/2] Checking VLC installation ---"
-if ! command -v vlc &> /dev/null; then
-    echo "VLC not found. Installing..."
-    apt update && apt install -y vlc
-else
-    echo "VLC is already installed."
-fi
-
-echo "--- [2/2] Starting System Update Sequence ---"
+echo "--- Starting System Update Sequence ---"
 
 # 1. Update package list
 echo "Updating package lists..."
